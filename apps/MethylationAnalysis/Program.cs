@@ -2,7 +2,6 @@
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading.Tasks;
 using System.Threading;
 using System.IO;
 using ASELib;
@@ -57,9 +56,6 @@ namespace MethylationAnalysis
 		// Key: Hugo Symbol
 		// Value: List of (case id, mutation count) tuples for this hugo symbol
 		static Dictionary<string, List<Tuple<string, int>>> mutationCounts = new Dictionary<string, List<Tuple<string, int>>>();
-
-		// lines to write to file
-		static List<ASETools.OutputLine> mannWhitneyLines = new List<ASETools.OutputLine>();
 
 		static void ProcessFile(ASETools.Case case_, bool isTumor, List<ASETools.GeneLocationInfo> genes)
 		{
@@ -173,9 +169,11 @@ namespace MethylationAnalysis
 		}
 
 		private static void MethylationMannWhitney(Dictionary<string, List<Tuple<string, Double>>> refsToProcess,
-			List<ASETools.GeneLocationInfo> genes)
+			List<ASETools.GeneLocationInfo> genes, string filename)
 		{
-			mannWhitneyLines = new List<ASETools.OutputLine>();
+			// Initialize file and write header
+			var output = ASETools.CreateStreamWriterWithRetry(filename);
+			WriteMannWhitneyHeader(output);
 
 			var bonferroniCorrection = diseases.Count() * compositeREFs.Count();
 
@@ -279,19 +277,20 @@ namespace MethylationAnalysis
 					if (significantDiseases > 0)
 					{
 						outputLine.line += "\t" + significantDiseases;
-						mannWhitneyLines.Add(outputLine);
+						output.WriteLine(outputLine.line);
 					}
 
 				} // foreach methylation point
 
 			} // foreach gene
 
+			output.Close();
+
 		}
 
 		// Writes out Mann Whitney results for methylation
-		static void WriteMannWhitneyResults(string filename)
+		static void WriteMannWhitneyHeader(StreamWriter output)
 		{
-			var output = ASETools.CreateStreamWriterWithRetry(filename);
 
 			// write header
 			output.Write("HugoSymbol\tStart\tDistanceToGene\tCompositeREF\t");
@@ -305,13 +304,6 @@ namespace MethylationAnalysis
 			output.Write("SignificantDiseases");
 
 			output.WriteLine();
-
-			foreach (var outputLine in mannWhitneyLines)
-			{
-				output.WriteLine(outputLine.line);
-			}
-
-			output.Close();
 		}
 
 		static void printUsageMessage()
@@ -328,8 +320,11 @@ namespace MethylationAnalysis
 			timer.Start();
 
 			var configuration = ASETools.Configuration.loadFromFile(args);
-			var cases = ASETools.Case.LoadCases(configuration.casesFilePathname).Where(r => 
-				r.Value.tumor_methylation_filename.Contains("HumanMethylation450")).ToList();
+			var cases = ASETools.Case.LoadCases(configuration.casesFilePathname)
+				.Where(r =>
+				r.Value.tumor_methylation_filename.Contains("HumanMethylation450"))
+				.ToList();
+
 
 			if (null == cases)
 			{
@@ -344,7 +339,7 @@ namespace MethylationAnalysis
 			// get diseases from selected cases to process
 			diseases = selectedCases.Select(r => r.disease()).Distinct().ToList();
 
-			if (configuration.commandLineArgs.Count() != 1)
+			if (configuration.commandLineArgs.Count() < 1)
 			{
 				printUsageMessage();
 				return;
@@ -352,32 +347,47 @@ namespace MethylationAnalysis
 
 			// Get genes to process
 			var knownGenes = ASETools.readKnownGeneFile(ASETools.Configuration.defaultGeneLocationInformationFilename);
+			var knownGeneNames = knownGenes.Select(r => r.Value.hugoSymbol);
 
 			var selectedGenes = new List<ASETools.GeneLocationInfo>();
+
+			foreach (var arg in configuration.commandLineArgs)
+			{
+				if (knownGeneNames.Contains(arg))
+				{
+					selectedGenes.Add(knownGenes[arg]);
+				}
+			}
 
 			// Get base pair distance from genes to process methylation values
 			maxDistance = Convert.ToInt32(configuration.commandLineArgs[0]);
 
-			var significantResults = ASETools.CreateStreamReaderWithRetry(configuration.finalResultsDirectory + "AlleleSpecificExpressionDistributionByMutationCount_bonferroni.txt");
-			significantResults.ReadLine();
-
-			string line;
-			while ((line = significantResults.ReadLine()) != null)
+			// If no genes were selected, run all genes that are significant
+			if (selectedGenes.Count() == 0)
 			{
-				var split = line.Split('\t');
-				var zeroDistance = split[2] == "0Kbp";
-				var geneName = ASETools.ConvertToNonExcelString(split[0]);
+				var significantResults = ASETools.CreateStreamReaderWithRetry(configuration.finalResultsDirectory + "AlleleSpecificExpressionDistributionByMutationCount_bonferroni.txt");
+				significantResults.ReadLine();
 
-				if (split[3].ToLower() != "true" && split[3].ToLower() != "false")
+				string line;
+				while ((line = significantResults.ReadLine()) != null)
 				{
-					continue;
-				}
-				var isSignificant = split[3] == "true";
+					var split = line.Split('\t');
 
-				ASETools.GeneLocationInfo geneInformation;
-				if (knownGenes.TryGetValue(geneName, out geneInformation) && isSignificant && !zeroDistance)
-				{
-					selectedGenes.Add(geneInformation);
+					// for now, filter out significant genes that have low p-values at gene
+					var zeroDistance = split[2] == "0Kbp";
+					var geneName = ASETools.ConvertToNonExcelString(split[0]);
+
+					if (split[3].ToLower() != "true" && split[3].ToLower() != "false")
+					{
+						continue;
+					}
+					var isSignificant = split[3] == "true";
+
+					ASETools.GeneLocationInfo geneInformation;
+					if (knownGenes.TryGetValue(geneName, out geneInformation) && isSignificant && !zeroDistance)
+					{
+						selectedGenes.Add(geneInformation);
+					}
 				}
 			}
 
@@ -393,10 +403,9 @@ namespace MethylationAnalysis
 			threads.ForEach(th => th.Join());
 
 			// Run Mann Whitney
-			var mannWhitneyOutputFilename = configuration.finalResultsDirectory + "mannWhitneyMethylation.txt";
+			var mannWhitneyOutputFilename = configuration.finalResultsDirectory + "MannWhitneyMethylation.txt";
 
-			MethylationMannWhitney(casesMethylation, selectedGenes);
-			WriteMannWhitneyResults(mannWhitneyOutputFilename);
+			MethylationMannWhitney(casesMethylation, selectedGenes, mannWhitneyOutputFilename);
 		}
 	}
 }
